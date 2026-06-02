@@ -1,0 +1,46 @@
+// Auto-converted from /tmp/df-ureq-2.12.1/ureq-2.12.1/src/cookies.rs
+
+use cookie_store::CookieStore;
+use std::ops::Deref;
+use std::sync::{ RwLock, RwLockReadGuard };
+use url::Url;
+#[derive(Debug)]
+struct CookieTin {
+ inner: RwLock<CookieStore>,
+}
+
+/// RAII guard for read access to the CookieStore.
+pub struct CookieStoreGuard<a> {
+ (RwLockReadGuard<'a, CookieStore>),
+}
+
+impl<a> Deref for CookieStoreGuard<'a> {
+ type Target = CookieStore;
+ fn deref(&self) -> &Self::Target {
+ &self.0
+ }
+ 
+}
+
+impl CookieTin {
+ fn new(store: CookieStore) -> Self {
+ CookieTin { inner: RwLock::new(store) }
+ }
+ 
+ fn read_lock(&self) -> CookieStoreGuard<'_> {
+ let lock = self.inner.read().unwrap();
+ CookieStoreGuard(lock)
+ }
+ 
+ fn get_request_cookies(&self, url: &Url) -> Vec<cookie::Cookie> {
+ let store = self.inner.read().unwrap();
+ store.get_request_values(url).map(| (name, value) | cookie::Cookie::new(name.to_owned(), value.to_owned())).collect()
+ }
+ 
+ fn store_response_cookies(&self, cookies: I, url: &Url) {
+ let mut store = self.inner.write().unwrap();
+ store.store_response_cookies(cookies, url);
+ }
+ 
+}
+

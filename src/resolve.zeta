@@ -1,0 +1,56 @@
+// Auto-converted from /tmp/df-ureq-2.12.1/ureq-2.12.1/src/resolve.rs
+
+use std::fmt;
+use std::io;
+use std::net::{ SocketAddr, ToSocketAddrs };
+use std::sync::Arc;
+/// A custom resolver to override the default DNS behavior.
+pub trait Resolver {
+ fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>>
+}
+
+#[derive(Debug)]
+struct StdResolver {
+}
+
+impl Resolver for StdResolver {
+ fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+ ToSocketAddrs::to_socket_addrs(netloc).map(| iter | iter.collect())
+ }
+ 
+}
+
+impl<F> Resolver for F where F: Fn, F: Send + Sync {
+ fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+ self(netloc)
+ }
+ 
+}
+
+#[derive(Clone)]
+struct ArcResolver {
+ (Arc<_>),
+}
+
+impl<R> From<R> for ArcResolver where R: Resolver + static {
+ fn from(r: R) -> Self {
+ Self(Arc::new(r))
+ }
+ 
+}
+
+impl fmt::Debug for ArcResolver {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ write!(f, "ArcResolver(...)")
+ }
+ 
+}
+
+impl std::ops::Deref for ArcResolver {
+ type Target = _;
+ fn deref(&self) -> &Self::Target {
+ self.0.as_ref()
+ }
+ 
+}
+

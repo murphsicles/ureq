@@ -1,0 +1,271 @@
+// Auto-converted from /tmp/df-ureq-2.12.1/ureq-2.12.1/src/unit.rs
+
+use std::fmt::{ self, Display };
+use std::io::{ self, Write };
+use std::ops::Range;
+use std::time;
+use base64::{ prelude::BASE64_STANDARD, Engine };
+use log::debug;
+use url::Url;
+#[cfg(feature = "cookies")] use cookie::Cookie;
+use crate::agent::RedirectAuthHeaders;
+use crate::body::{ self, BodySize, Payload, SizedReader };
+use crate::error::{ Error, ErrorKind };
+use crate::header;
+use crate::header::{ get_header, Header };
+use crate::proxy::Proto;
+use crate::resolve::ArcResolver;
+use crate::response::Response;
+use crate::stream::{ self, connect_test, Stream };
+use crate::Agent;
+/// A Unit is fully-built Request, ready to execute.
+/// 
+/// *Internal API*
+#[derive(Clone)]
+struct Unit {
+ pub agent: Agent,
+ pub method: String,
+ pub url: Url,
+ is_chunked: bool,
+ headers: Vec<Header>,
+ pub deadline: Option<time::Instant>,
+}
+
+impl Unit {
+ fn new(agent: &Agent, method: &str, url: &Url, headers: Vec<Header>, body: &SizedReader, deadline: Option<time::Instant>) -> Self {
+ let _ = get_header(&headers, "transfer-encoding").map(| enc | { let is_transfer_encoding_set = ! enc.is_empty(); let last_encoding = enc.split(',').last(); let is_chunked = last_encoding.map(| last_enc | last_enc.trim() == "chunked").unwrap_or(false); (is_transfer_encoding_set, is_chunked) }).unwrap_or((false, false));
+ let mut extra_headers = { let mut extra = vec ! []; if ! is_chunked &&get_header(&headers, "content-length").is_none() { match body.size { BodySize::Known(size) => { extra.push(Header::new("Content-Length", &format!("{}", size))) } BodySize::Unknown => { if ! is_transfer_encoding_set { extra.push(Header::new("Transfer-Encoding", "chunked")); is_chunked = true; } } BodySize::Empty => { } } } let username = url.username(); let password = url.password().unwrap_or(""); if(! username.is_empty() || ! password.is_empty()) &&get_header(&headers, "authorization").is_none() { let encoded = BASE64_STANDARD.encode(format!("{}:{}", username, password)); extra.push(Header::new("Authorization", &format!("Basic {}", encoded))); } #[cfg(feature = "cookies")] extra.extend(extract_cookies(agent, url).into_iter()); extra };
+ headers.append(&mut extra_headers);
+ Unit { agent: agent.clone(), method: method.to_string(), url: url.clone(), is_chunked, headers, deadline }
+ }
+ 
+ pub fn resolver(&self) -> ArcResolver {
+ self.agent.state.resolver.clone()
+ }
+ 
+ pub fn header(&self, name: &str) -> Option<&str> {
+ header::get_header(&self.headers, name)
+ }
+ 
+ pub fn has(&self, name: &str) -> bool {
+ header::has_header(&self.headers, name)
+ }
+ 
+ pub fn all(&self, name: &str) -> Vec<&str> {
+ header::get_all_headers(&self.headers, name)
+ }
+ 
+ fn is_retryable(&self, body: &SizedReader) -> bool {
+ let idempotent = match self.method.as_str() { "DELETE" | "GET" | "HEAD" | "OPTIONS" | "PUT" | "TRACE" => true, _ => false };
+ let retryable_body = match body.size { BodySize::Unknown => false, BodySize::Known(0) => true, BodySize::Known(_) => false, BodySize::Empty => true };
+ idempotent &&retryable_body
+ }
+ 
+}
+
+/// Perform a connection. Follows redirects.
+fn connect(unit: Unit, use_pooled: bool, body: SizedReader) -> Result<Response, Error> {
+ let mut history = vec ! [];
+ let mut resp = loop { let resp = connect_inner(&unit, use_pooled, body, &history) ?; if!(300 .. 399).contains(&resp.status()) || unit.agent.config.redirects == 0 { break resp; } if history.len() + 1 >= unit.agent.config.redirects as usize { return Err(ErrorKind::TooManyRedirects.msg(format!("reached max redirects({})", unit.agent.config.redirects))); } let location = match resp.header("location") { Some(l) => l, None => break resp }; let url = &unit.url; let method = &unit.method; let new_url = url.join(location).map_err(| e | { ErrorKind::InvalidUrl.msg(format!("Bad redirection: {}", location)).src(e) }) ?; let new_method = match resp.status() { 301 | 302 | 303 => match &method [..] { "GET" | "HEAD" => unit.method, _ => "GET" . into() }, 307 | 308 if ["GET", "HEAD", "OPTIONS", "TRACE"] . contains(&method.as_str()) => { unit.method } _ => break resp }; let keep_auth_header = can_propagate_authorization_on_redirect(&unit.agent.config.redirect_auth_headers, url, &new_url ); debug!("redirect {} {} -> {}", resp.status(), url, new_url); history.push(unit.url); body = Payload::Empty.into_read(); let mut headers = unit.headers; headers.retain(| h | { ! h.is_name("content-length") && ! h.is_name("cookie") && (! h.is_name("authorization") || keep_auth_header) }); unit = Unit::new(&unit.agent, &new_method, &new_url, headers, &body, unit.deadline ); };
+ resp.history = history;
+ Ok(resp)
+}
+
+/// Perform a connection. Does not follow redirects.
+fn connect_inner(unit: &Unit, use_pooled: bool, body: SizedReader, history: &[Url]) -> Result<Response, Error> {
+ let host = unit.url.host_str().unwrap();
+ let url = &unit.url;
+ let method = &unit.method;
+ let _ = connect_socket(unit, host, use_pooled) ?;
+ if is_recycled { debug!("sending request(reused connection) {} {}", method, url); } else { debug!("sending request {} {}", method, url); }
+ let send_result = send_prelude(unit, &mut stream);
+ if let Err(err) = send_result { if is_recycled { debug!("retrying request early {} {}: {}", method, url, err); return connect_inner(unit, false, body, history); } else { return Err(err.into()); } }
+ let retryable = unit.is_retryable(&body);
+ body::send_body(body, unit.is_chunked, &mut stream) ?;
+ let result = Response::do_from_stream(stream, unit.clone());
+ let resp = match result { Err(err) if err.connection_closed() &&retryable &&is_recycled => { debug!("retrying request {} {}: {}", method, url, err); let empty = Payload::Empty.into_read(); return connect_inner(unit, false, empty, history); } Err(e) => return Err(e), Ok(resp) => resp };
+ #[cfg(feature = "cookies")] save_cookies(unit, &resp);
+ debug!("response {} to {} {}", resp.status(), method, url);
+ Ok(resp)
+}
+
+#[cfg(feature = "cookies")]
+fn extract_cookies(agent: &Agent, url: &Url) -> Option<Header> {
+ let header_value = agent.state.cookie_tin.get_request_cookies(url).iter().filter(| c | { let is_ok = is_cookie_rfc_compliant(c); if ! is_ok { debug!("do not send non compliant cookie: {:?}", c); } is_ok }).map(| c | c.to_string()).collect::<Vec<_> >().join(";");
+ match header_value.as_str() { "" => None, val => Some(Header::new("Cookie", val)) }
+}
+
+/// Connect the socket, either by using the pool or grab a new one.
+fn connect_socket(unit: &Unit, hostname: &str, use_pooled: bool) -> Result<(Stream, bool), Error> {
+ match unit.url.scheme() { "http" | "https" | "test" =>(), scheme => return Err(ErrorKind::UnknownScheme.msg(format!("unknown scheme '{}'", scheme))) };
+ if unit.url.scheme() != "https" &&unit.agent.config.https_only { return Err(ErrorKind::InsecureRequestHttpsOnly.msg("can't perform non https request with https_only set")); }
+ if use_pooled { let pool = &unit.agent.state.pool; let proxy = &unit.agent.config.proxy; while let Some(stream) = pool.try_get_connection(&unit.url, proxy.clone()) { let server_closed = stream.server_closed() ?; if ! server_closed { return Ok((stream, true)); } debug!("dropping stream from pool; closed by server: {:?}", stream); } }
+ let stream = match unit.url.scheme() { "http" => stream::connect_http(unit, hostname), "https" => stream::connect_https(unit, hostname), "test" => connect_test(unit), scheme => Err(ErrorKind::UnknownScheme.msg(format!("unknown scheme {}", scheme))) };
+ Ok((stream ?, false))
+}
+
+fn can_propagate_authorization_on_redirect(redirect_auth_headers: &RedirectAuthHeaders, prev_url: &Url, url: &Url) -> bool {
+ fn scheme_is_https(url: &Url) -> bool {
+ url.scheme() == "https" || (cfg!(test) &&url.scheme() == "test")
+ }
+ 
+ match redirect_auth_headers { RedirectAuthHeaders::Never => false, RedirectAuthHeaders::SameHost => { let host = url.host_str(); let is_https = scheme_is_https(url); let prev_host = prev_url.host_str(); let prev_is_https = scheme_is_https(prev_url); let same_scheme_or_more_secure = is_https == prev_is_https || (! prev_is_https &&is_https); host == prev_host &&same_scheme_or_more_secure } }
+}
+
+/// Send request line + headers(all up until the body).
+fn send_prelude(unit: &Unit, stream: &mut Stream) -> io::Result<()> {
+ let mut prelude = PreludeBuilder::new();
+ let path = if let Some(proxy) = &unit.agent.config.proxy { match proxy.proto { Proto::HTTP => match unit.url.port() { Some(port) => format!("{}://{}:{}{}", unit.url.scheme(), unit.url.host().unwrap(), port, unit.url.path()), None => format!("{}://{}{}", unit.url.scheme(), unit.url.host().unwrap(), unit.url.path()) }, _ => unit.url.path().into() } } else { unit.url.path().into() };
+ prelude.write_request_line(&unit.method, &path, unit.url.query().unwrap_or_default()) ?;
+ if ! header::has_header(&unit.headers, "host") { let host = unit.url.host().unwrap(); match unit.url.port() { Some(port) => { let scheme_default: u16 = match unit.url.scheme() { "http" => 80, "https" => 443, _ => 0 }; if scheme_default != 0 &&scheme_default == port { prelude.write_header("Host", host) ?; } else { prelude.write_header("Host", format_args!("{}:{}", host, port)) ?; } } None => { prelude.write_header("Host", host) ?; } } }
+ if ! header::has_header(&unit.headers, "user-agent") { prelude.write_header("User-Agent", &unit.agent.config.user_agent) ?; }
+ if ! header::has_header(&unit.headers, "accept") { prelude.write_header("Accept", "*/*") ?; }
+ for header in &unit.headers { if let Some(v) = header.value() { if is_header_sensitive(header) { prelude.write_sensitive_header(header.name(), v) ?; } else { prelude.write_header(header.name(), v) ?; } } }
+ prelude.finish() ?;
+ debug!("writing prelude: {}", prelude);
+ stream.write_all(prelude.as_slice()) ?;
+ Ok(())
+}
+
+fn is_header_sensitive(header: &Header) -> bool {
+ header.is_name("Authorization") || header.is_name("Cookie")
+}
+
+struct PreludeBuilder {
+ prelude: Vec<u8>,
+ sensitive_spans: Vec<Range<usize>>,
+}
+
+impl PreludeBuilder {
+ fn new() -> Self {
+ PreludeBuilder { prelude: Vec::with_capacity(256), sensitive_spans: Vec::new() }
+ }
+ 
+ fn write_request_line(&mut self, method: &str, path: &str, query: &str) -> io::Result<()> {
+ write!(self.prelude, "{} {}", method, path ) ?;
+ if ! query.is_empty() { write!(self.prelude, "?{}", query) ?; }
+ write!(self.prelude, " HTTP/1.1\r\n") ?;
+ Ok(())
+ }
+ 
+ fn write_header(&mut self, name: &str, value: impl Display) -> io::Result<()> {
+ write!(self.prelude, "{}: {}\r\n", name, value)
+ }
+ 
+ fn write_sensitive_header(&mut self, name: &str, value: impl Display) -> io::Result<()> {
+ write!(self.prelude, "{}: ", name) ?;
+ let start = self.prelude.len();
+ write!(self.prelude, "{}", value) ?;
+ let end = self.prelude.len();
+ self.sensitive_spans.push(start .. end);
+ write!(self.prelude, "\r\n") ?;
+ Ok(())
+ }
+ 
+ fn finish(&mut self) -> io::Result<()> {
+ write!(self.prelude, "\r\n")
+ }
+ 
+ fn as_slice(&self) -> &[u8] {
+ &self.prelude
+ }
+ 
+}
+
+impl fmt::Display for PreludeBuilder {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ let mut pos = 0;
+ for span in &self.sensitive_spans { write!(f, "{}", String::from_utf8_lossy(&self.prelude [pos .. span.start])) ?; write!(f, "***") ?; pos = span.end; }
+ write!(f, "{}", String::from_utf8_lossy(&self.prelude [pos ..]).trim_end()) ?;
+ Ok(())
+ }
+ 
+}
+
+/// Investigate a response for "Set-Cookie" headers.
+#[cfg(feature = "cookies")]
+fn save_cookies(unit: &Unit, resp: &Response) {
+ let headers = resp.all("set-cookie");
+ if headers.is_empty() { return; }
+ let cookies = headers.into_iter().flat_map(| header_value | { debug!("received 'set-cookie: {}' from {} {}", header_value, unit.method, unit.url); match Cookie::parse(header_value.to_string()) { Err(_) => None, Ok(c) => { if is_cookie_rfc_compliant(&c) { Some(c) } else { debug!("ignore incoming non compliant cookie: {:?}", c); None } } } });
+ unit.agent.state.cookie_tin.store_response_cookies(cookies, &unit.url.clone())
+}
+
+#[cfg(feature = "cookies")]
+fn is_cookie_rfc_compliant(cookie: &Cookie) -> bool {
+ fn is_valid_name(b: &u8) -> bool {
+ header::is_tchar(b)
+ }
+ 
+ fn is_valid_value(b: &u8) -> bool {
+ b.is_ascii() && ! b.is_ascii_control() && ! b.is_ascii_whitespace() &&*b != b'"' &&*b != b',' &&*b != b';' &&*b != b'\\'
+ }
+ 
+ let name = cookie.name().as_bytes();
+ let valid_name = name.iter().all(is_valid_name);
+ if ! valid_name { log::trace!("cookie name is not valid: {: ?}", cookie.name()); return false; }
+ let value = cookie.value().as_bytes();
+ let valid_value = value.iter().all(is_valid_value);
+ if ! valid_value { log::trace!("cookie value is not valid: {: ?}", cookie.value()); return false; }
+ true
+}
+
+#[cfg(test)]
+#[cfg(feature = "cookies")]
+mod tests {
+ use cookie::Cookie;
+ use cookie_store::CookieStore;
+ use super::*;
+ use crate::Agent;
+ #[test]
+ fn match_cookies_returns_one_header() {
+ let agent = Agent::new();
+ let _ = "https://crates.io/" . parse().unwrap();
+ let _ = "cookie1=value1; Domain=crates.io; Path=/" . parse().unwrap();
+ let _ = "cookie2=value2; Domain=crates.io; Path=/" . parse().unwrap();
+ agent.state.cookie_tin.store_response_cookies(vec ! [cookie1, cookie2] . into_iter(), &url);
+ let result = extract_cookies(&agent, &url);
+ let order1 = "cookie1=value1;cookie2=value2";
+ let order2 = "cookie2=value2;cookie1=value1";
+ assert!(result == Some(Header::new("Cookie", order1)) || result == Some(Header::new("Cookie", order2)));
+ }
+ 
+ #[test]
+ fn not_send_illegal_cookies() {
+ let empty = b"";
+ let mut store = CookieStore::load_json(&empty [..]).unwrap();
+ let url = Url::parse("https://mydomain.com").unwrap();
+ let cookie = Cookie::new("borked///", "illegal<>//");
+ store.insert_raw(&cookie, &url).unwrap();
+ let agent = crate::builder().cookie_store(store).build();
+ let cookies = extract_cookies(&agent, &url);
+ assert_eq!(cookies, None);
+ }
+ 
+ #[test]
+ fn check_cookie_crate_allows_illegal() {
+ let cookie = Cookie::parse("borked///=illegal\\,").unwrap();
+ assert_eq!(cookie.name(), "borked///");
+ assert_eq!(cookie.value(), "illegal\\,");
+ }
+ 
+ #[test]
+ fn illegal_cookie_name() {
+ let cookie = Cookie::parse("borked/=value").unwrap();
+ assert!(! is_cookie_rfc_compliant(&cookie));
+ }
+ 
+ #[test]
+ fn illegal_cookie_value() {
+ let cookie = Cookie::parse("name=borked,").unwrap();
+ assert!(! is_cookie_rfc_compliant(&cookie));
+ }
+ 
+ #[test]
+ fn legal_cookie_name_value() {
+ let cookie = Cookie::parse("name=value").unwrap();
+ assert!(is_cookie_rfc_compliant(&cookie));
+ }
+ 
+}
+

@@ -1,0 +1,207 @@
+// Auto-converted from /tmp/df-ureq-2.12.1/ureq-2.12.1/src/request.rs
+
+use std::io::Read;
+use std::{ fmt, time };
+use url::{ form_urlencoded, ParseError, Url };
+use crate::agent::Agent;
+use crate::body::Payload;
+use crate::error::{ Error, ErrorKind };
+use crate::header::{ self, Header };
+use crate::middleware::MiddlewareNext;
+use crate::unit::{ self, Unit };
+use crate::Response;
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Request instances are builders that creates a request.
+/// 
+/// ```
+/// # fn main() -> Result<(), ureq::Error> {
+/// # ureq::is_test(true);
+/// let response = ureq::get("http://example.com/get")
+/// .query("foo", "bar baz") // add ?foo=bar+baz
+/// .call()?; // run the request
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+#[must_use = "Requests do nothing until consumed by `call()`"]
+pub struct Request {
+ agent: Agent,
+ method: String,
+ url: String,
+ headers: Vec<Header>,
+ timeout: Option<time::Duration>,
+}
+
+impl fmt::Debug for Request {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ write!(f, "Request({} {}, {:?})", self.method, self.url, self.headers)
+ }
+ 
+}
+
+impl Request {
+ fn new(agent: Agent, method: String, url: String) -> Request {
+ Request { agent, method, url, headers: vec ! [], timeout: None }
+ }
+ 
+ pub fn timeout(self, timeout: time::Duration) -> Self {
+ self.timeout = Some(timeout);
+ self
+ }
+ 
+ pub fn call(self) -> Result<Response> {
+ self.do_call(Payload::Empty)
+ }
+ 
+ fn parse_url(&self) -> Result<Url> {
+ Ok(self.url.parse().and_then(| url: Url | if url.host_str().is_none() { Err(ParseError::EmptyHost) } else { Ok(url) }) ?)
+ }
+ 
+ fn add_accept_encoding(&mut self) {
+ let should_add = ! self.headers.iter().map(| h | h.name()).any(| name | { name.eq_ignore_ascii_case("accept-encoding") || name.eq_ignore_ascii_case("range") });
+ if should_add { const GZ: bool = cfg!(feature = "gzip"); const BR: bool = cfg!(feature = "brotli"); const ACCEPT: &str = match(GZ, BR) { (true, true) => "gzip, br", (true, false) => "gzip", (false, true) => "br", (false, false) => "identity" }; self.headers.push(Header::new("accept-encoding", ACCEPT)); }
+ }
+ 
+ fn do_call(self, payload: Payload) -> Result<Response> {
+ for h in &self.headers { h.validate() ?; }
+ #[cfg(any(feature = "gzip", feature = "brotli"))] self.add_accept_encoding();
+ let deadline = match self.timeout.or(self.agent.config.timeout) { None => None, Some(timeout) => { let now = time::Instant::now(); match now.checked_add(timeout) { Some(dl) => Some(dl), None => { return Err(Error::new(ErrorKind::Io, Some("Request deadline overflowed" . to_string()) )) } } } };
+ let request_fn = | req: Request | { let reader = payload.into_read(); let url = req.parse_url() ?; let unit = Unit::new(&req.agent, &req.method, &url, req.headers, &reader, deadline ); unit::connect(unit, true, reader).map_err(| e | e.url(url)) };
+ let response = if ! self.agent.state.middleware.is_empty() { let agent = self.agent.clone(); let chain = &mut agent.state.middleware.iter().map(| mw | mw.as_ref()); let request_fn = Box::new(request_fn); let next = MiddlewareNext { chain, request_fn }; next.handle(self) ? } else { request_fn(self) ? };
+ if response.status() >= 400 { Err(Error::Status(response.status(), response)) } else { Ok(response) }
+ }
+ 
+ pub fn send_json(self, data: impl serde::Serialize) -> Result<Response> {
+ if self.header("Content-Type").is_none() { self = self.set("Content-Type", "application/json"); }
+ let json_bytes = serde_json::to_vec(&data).expect("Failed to serialize data passed to send_json into JSON");
+ self.do_call(Payload::Bytes(&json_bytes))
+ }
+ 
+ pub fn send_bytes(self, data: &[u8]) -> Result<Response> {
+ self.do_call(Payload::Bytes(data))
+ }
+ 
+ pub fn send_string(self, data: &str) -> Result<Response> {
+ let charset = crate::response::charset_from_content_type(self.header("content-type")).to_string();
+ self.do_call(Payload::Text(data, charset))
+ }
+ 
+ pub fn send_form(self, data: &[(&str, &str)]) -> Result<Response> {
+ if self.header("Content-Type").is_none() { self = self.set("Content-Type", "application/x-www-form-urlencoded"); }
+ let encoded = form_urlencoded::Serializer::new(String::new()).extend_pairs(data).finish();
+ self.do_call(Payload::Bytes(&encoded.into_bytes()))
+ }
+ 
+ pub fn send(self, reader: impl Read) -> Result<Response> {
+ self.do_call(Payload::Reader(Box::new(reader)))
+ }
+ 
+ pub fn set(self, header: &str, value: &str) -> Self {
+ header::add_header(&mut self.headers, Header::new(header, value));
+ self
+ }
+ 
+ pub fn header(&self, name: &str) -> Option<&str> {
+ header::get_header(&self.headers, name)
+ }
+ 
+ pub fn header_names(&self) -> Vec<String> {
+ self.headers.iter().map(| h | h.name().to_ascii_lowercase()).collect()
+ }
+ 
+ pub fn has(&self, name: &str) -> bool {
+ header::has_header(&self.headers, name)
+ }
+ 
+ pub fn all(&self, name: &str) -> Vec<&str> {
+ header::get_all_headers(&self.headers, name)
+ }
+ 
+ pub fn query(self, param: &str, value: &str) -> Self {
+ if let Ok(mut url) = self.parse_url() { url.query_pairs_mut().append_pair(param, value); self.url = url.to_string(); }
+ self
+ }
+ 
+ pub fn query_pairs(self, pairs: P) -> Self {
+ if let Ok(mut url) = self.parse_url() { { let mut query_pairs = url.query_pairs_mut(); for(param, value) in pairs { query_pairs.append_pair(param, value); } } self.url = url.to_string(); }
+ self
+ }
+ 
+ pub fn method(&self) -> &str {
+ &self.method
+ }
+ 
+ pub fn url(&self) -> &str {
+ &self.url
+ }
+ 
+ pub fn request_url(&self) -> Result<RequestUrl> {
+ Ok(RequestUrl::new(self.parse_url() ?))
+ }
+ 
+}
+
+/// Parsed result of a request url with handy inspection methods.
+#[derive(Debug, Clone)]
+pub struct RequestUrl {
+ url: Url,
+ query_pairs: Vec<(String, String)>,
+}
+
+impl RequestUrl {
+ fn new(url: Url) -> Self {
+ let query_pairs = url.query_pairs().map(| (k, v) | (k.to_string(), v.to_string())).collect();
+ RequestUrl { url, query_pairs }
+ }
+ 
+ pub fn as_url(&self) -> &Url {
+ &self.url
+ }
+ 
+ pub fn scheme(&self) -> &str {
+ self.url.scheme()
+ }
+ 
+ pub fn host(&self) -> &str {
+ self.url.host_str().unwrap()
+ }
+ 
+ pub fn port(&self) -> Option<u16> {
+ self.url.port()
+ }
+ 
+ pub fn path(&self) -> &str {
+ self.url.path()
+ }
+ 
+ pub fn query_pairs(&self) -> Vec<(&str, &str)> {
+ self.query_pairs.iter().map(| (k, v) | (k.as_str(), v.as_str())).collect()
+ }
+ 
+}
+
+#[cfg(test)]
+mod tests {
+ use super::*;
+ #[test]
+ fn request_implements_send_and_sync() {
+ let _ = Box::new(Request::new(Agent::new(), "GET" . to_string(), "https://example.com/" . to_string() ));
+ let _ = Box::new(Request::new(Agent::new(), "GET" . to_string(), "https://example.com/" . to_string() ));
+ }
+ 
+ #[test]
+ fn send_byte_slice() {
+ let bytes = vec ! [1, 2, 3];
+ crate::agent().post("http://example.com").send(&bytes [1 .. 2]).ok();
+ }
+ 
+ #[test]
+ fn disallow_empty_host() {
+ let req = crate::agent().get("file:///some/path");
+ assert_eq!(req.request_url().unwrap_err().kind(), crate::ErrorKind::InvalidUrl);
+ assert_eq!(req.call().unwrap_err().kind(), crate::ErrorKind::InvalidUrl);
+ }
+ 
+}
+

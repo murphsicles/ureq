@@ -1,0 +1,207 @@
+// Auto-converted from /tmp/df-ureq-2.12.1/ureq-2.12.1/src/lib.rs
+
+#[doc = " Re-exported rustls crate"] #[doc = ""] #[doc = " Use this re-export to always get a compatible version of `ClientConfig`."] #[cfg(feature = "tls")] pub use rustls;
+#[doc = " Re-exported native-tls crate"] #[doc = ""] #[doc = " Use this re-export to always get a compatible version of `TlsConnector`."] #[cfg(feature = "native-tls")] pub use native_tls;
+mod agent;
+mod body;
+mod chunked;
+mod error;
+mod header;
+mod middleware;
+mod pool;
+mod proxy;
+mod request;
+mod resolve;
+mod response;
+mod stream;
+mod unit;
+#[cfg(feature = "tls")]
+mod rtls;
+#[cfg(feature = "native-tls")]
+mod ntls;
+#[cfg(feature = "tls")]
+fn default_tls_config() -> std::sync::Arc<_> {
+ rtls::default_tls_config()
+}
+
+#[cfg(not(feature = "tls"))]
+fn default_tls_config() -> std::sync::Arc<_> {
+ use std::sync::Arc;
+ struct NoTlsConfig {
+ }
+ 
+ impl TlsConnector for NoTlsConfig {
+ fn connect(&self, _dns_name: &str, _io: Box<_>) -> Result<Box<_>, crate::error::Error> {
+ Err(ErrorKind::UnknownScheme.msg("cannot make HTTPS request because no TLS backend is configured"))
+ }
+ 
+ }
+ 
+ Arc::new(NoTlsConfig)
+}
+
+#[cfg(feature = "cookies")]
+mod cookies;
+#[cfg(feature = "json")] pub use serde_json::json;
+use url::Url;
+#[cfg(test)]
+mod test;
+mod testserver;
+#[cfg(feature = "http-interop")]
+mod http_interop;
+#[cfg(feature = "http-crate")]
+mod http_crate;
+pub use crate::agent::Agent;
+pub use crate::agent::AgentBuilder;
+pub use crate::agent::RedirectAuthHeaders;
+pub use crate::error::{ Error, ErrorKind, OrAnyStatus, Transport };
+pub use crate::middleware::{ Middleware, MiddlewareNext };
+pub use crate::proxy::Proxy;
+pub use crate::request::{ Request, RequestUrl };
+pub use crate::resolve::Resolver;
+pub use crate::response::Response;
+pub use crate::stream::{ ReadWrite, TlsConnector };
+#[cfg(feature = "cookies")] pub use cookie::Cookie;
+#[cfg(feature = "json")] pub use { serde, serde_json };
+pub type SerdeMap<K, V> = serde_json::Map<K, V>;
+
+pub type SerdeValue = serde_json::Value;
+
+#[cfg(feature = "json")]
+#[deprecated(note = "use ureq::serde_json::to_value instead")]
+pub fn serde_to_value<T: serde::Serialize>(value: T) -> std::result::Result<serde_json::Value, serde_json::Error> {
+ serde_json::to_value(value)
+}
+
+use once_cell::sync::Lazy;
+use std::sync::atomic::{ AtomicBool, Ordering };
+/// Creates an [AgentBuilder].
+pub fn builder() -> AgentBuilder {
+ AgentBuilder::new()
+}
+
+pub fn is_test(is: bool) -> bool {
+ static IS_TEST: Lazy<AtomicBool> = Lazy::new(| | AtomicBool::new(false));
+ 
+ if is { IS_TEST.store(true, Ordering::SeqCst); }
+ IS_TEST.load(Ordering::SeqCst)
+}
+
+/// Agents are used to hold configuration and keep state between requests.
+pub fn agent() -> Agent {
+ #[cfg(not(test))] if is_test(false) { testserver::test_agent() } else { AgentBuilder::new().build() }
+ #[cfg(test)] testserver::test_agent()
+}
+
+/// Make a request with the HTTP verb as a parameter.
+/// 
+/// This allows making requests with verbs that don't have a dedicated
+/// method.
+/// 
+/// If you've got an already-parsed [`Url`], try [`request_url()`].
+/// 
+/// ```
+/// # fn main() -> Result<(), ureq::Error> {
+/// # ureq::is_test(true);
+/// let resp: ureq::Response = ureq::request("OPTIONS", "http://example.com/")
+/// .call()?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn request(method: &str, path: &str) -> Request {
+ agent().request(method, path)
+}
+
+/// Make a request using an already-parsed [Url].
+/// 
+/// This is useful if you've got a parsed [`Url`] from some other source, or if
+/// you want to parse the URL and then modify it before making the request.
+/// If you'd just like to pass a [`String`] or a [`&str`], try [`request()`].
+/// 
+/// ```
+/// # fn main() -> Result<(), ureq::Error> {
+/// # ureq::is_test(true);
+/// use url::Url;
+/// let agent = ureq::agent();
+/// 
+/// let mut url: Url = "http://example.com/some-page".parse()?;
+/// url.set_path("/get/robots.txt");
+/// let resp: ureq::Response = ureq::request_url("GET", &url)
+/// .call()?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn request_url(method: &str, url: &Url) -> Request {
+ agent().request_url(method, url)
+}
+
+/// Make a GET request.
+pub fn get(path: &str) -> Request {
+ request("GET", path)
+}
+
+/// Make a HEAD request.
+pub fn head(path: &str) -> Request {
+ request("HEAD", path)
+}
+
+/// Make a PATCH request.
+pub fn patch(path: &str) -> Request {
+ request("PATCH", path)
+}
+
+/// Make a POST request.
+pub fn post(path: &str) -> Request {
+ request("POST", path)
+}
+
+/// Make a PUT request.
+pub fn put(path: &str) -> Request {
+ request("PUT", path)
+}
+
+/// Make a DELETE request.
+pub fn delete(path: &str) -> Request {
+ request("DELETE", path)
+}
+
+#[cfg(test)]
+mod tests {
+ use super::*;
+ #[test]
+ fn connect_http_google() {
+ let agent = Agent::new();
+ let resp = agent.get("http://www.google.com/").call().unwrap();
+ assert_eq!("text/html;charset=ISO-8859-1", resp.header("content-type").unwrap().replace("; ", ";"));
+ assert_eq!("text/html", resp.content_type());
+ }
+ 
+ #[test]
+ #[cfg(feature = "tls")]
+ fn connect_https_google_rustls() {
+ let agent = Agent::new();
+ let resp = agent.get("https://www.google.com/").call().unwrap();
+ assert_eq!("text/html;charset=ISO-8859-1", resp.header("content-type").unwrap().replace("; ", ";"));
+ assert_eq!("text/html", resp.content_type());
+ }
+ 
+ #[test]
+ #[cfg(feature = "native-tls")]
+ fn connect_https_google_native_tls() {
+ use std::sync::Arc;
+ let tls_config = native_tls::TlsConnector::new().unwrap();
+ let agent = builder().tls_connector(Arc::new(tls_config)).build();
+ let resp = agent.get("https://www.google.com/").call().unwrap();
+ assert_eq!("text/html;charset=ISO-8859-1", resp.header("content-type").unwrap().replace("; ", ";"));
+ assert_eq!("text/html", resp.content_type());
+ }
+ 
+ #[test]
+ fn connect_https_invalid_name() {
+ let result = get("https://example.com{REQUEST_URI}/").call();
+ let e = ErrorKind::Dns;
+ assert_eq!(result.unwrap_err().kind(), e);
+ }
+ 
+}
+
