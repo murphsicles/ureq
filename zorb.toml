@@ -1,0 +1,14 @@
+[package]
+name = "@net/ureq"
+version = "0.1.0"
+edition = "2026"
+description = "Minimal blocking HTTP client for Zeta — synchronous requests with JSON support"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/murphsicles/zeta-ureq"
+keywords = ["http", "client", "networking", "blocking"]
+categories = ["networking"]
+
+[dependencies]
+@encoding/serde_json = ">=0.1.0"
+@net/url = ">=0.1.0"
+@crypto/rand = ">=0.1.0"

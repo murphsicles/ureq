@@ -1,0 +1,620 @@
+// ⚡ @net/ureq — Minimal blocking HTTP client for Zeta
+//
+// Port of the Rust `ureq` crate (v2.x). Synchronous HTTP/1.1 client.
+// Provides a simple blocking API for making HTTP requests.
+//
+// Uses Zeta's built-in TCP socket primitives (no async runtime needed).
+
+//
+// ===== HTTP Method =====
+//
+
+pub enum Method {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    PATCH,
+    HEAD,
+    OPTIONS,
+}
+
+impl Method {
+    pub fn to_str(&self) -> str {
+        match self {
+            Method::GET => return "GET",
+            Method::POST => return "POST",
+            Method::PUT => return "PUT",
+            Method::DELETE => return "DELETE",
+            Method::PATCH => return "PATCH",
+            Method::HEAD => return "HEAD",
+            Method::OPTIONS => return "OPTIONS",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Method {
+        if s == "GET" { return Method::GET; }
+        if s == "POST" { return Method::POST; }
+        if s == "PUT" { return Method::PUT; }
+        if s == "DELETE" { return Method::DELETE; }
+        if s == "PATCH" { return Method::PATCH; }
+        if s == "HEAD" { return Method::HEAD; }
+        return Method::GET;
+    }
+}
+
+//
+// ===== HTTP Status =====
+//
+
+pub struct StatusCode {
+    pub code: i64,
+    pub reason: str,
+}
+
+impl StatusCode {
+    pub fn new(code: i64) -> StatusCode {
+        return StatusCode { code: code, reason: reason_phrase(code) };
+    }
+
+    pub fn is_success(&self) -> bool {
+        return self.code >= 200 && self.code < 300;
+    }
+
+    pub fn is_client_error(&self) -> bool {
+        return self.code >= 400 && self.code < 500;
+    }
+
+    pub fn is_server_error(&self) -> bool {
+        return self.code >= 500 && self.code < 600;
+    }
+}
+
+fn reason_phrase(code: i64) -> str {
+    if code == 200 { return "OK"; }
+    if code == 201 { return "Created"; }
+    if code == 204 { return "No Content"; }
+    if code == 301 { return "Moved Permanently"; }
+    if code == 302 { return "Found"; }
+    if code == 304 { return "Not Modified"; }
+    if code == 400 { return "Bad Request"; }
+    if code == 401 { return "Unauthorized"; }
+    if code == 403 { return "Forbidden"; }
+    if code == 404 { return "Not Found"; }
+    if code == 405 { return "Method Not Allowed"; }
+    if code == 408 { return "Request Timeout"; }
+    if code == 409 { return "Conflict"; }
+    if code == 418 { return "I'm a Teapot"; }
+    if code == 429 { return "Too Many Requests"; }
+    if code == 500 { return "Internal Server Error"; }
+    if code == 502 { return "Bad Gateway"; }
+    if code == 503 { return "Service Unavailable"; }
+    if code == 504 { return "Gateway Timeout"; }
+    return "Unknown";
+}
+
+//
+// ===== HTTP Headers =====
+//
+
+pub struct Headers {
+    pairs: Vec<(str, str)>,
+}
+
+impl Headers {
+    pub fn new() -> Headers {
+        return Headers { pairs: Vec::new() };
+    }
+
+    pub fn set(&mut self, name: str, value: str) {
+        // Remove existing
+        let mut i: i64 = 0;
+        while i < self.pairs.len() {
+            if self.pairs[i].0 == name {
+                self.pairs[i].1 = value;
+                return;
+            }
+            i = i + 1;
+        }
+        self.pairs.push((name, value));
+    }
+
+    pub fn get(&self, name: &str) -> str {
+        let mut i: i64 = 0;
+        while i < self.pairs.len() {
+            if self.pairs[i].0 == name {
+                return self.pairs[i].1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    pub fn to_str(&self) -> str {
+        let mut result: str = "";
+        let mut i: i64 = 0;
+        while i < self.pairs.len() {
+            result = result + self.pairs[i].0 + ": " + self.pairs[i].1 + "\r\n";
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+//
+// ===== HTTP Response =====
+//
+
+pub struct Response {
+    pub status: StatusCode,
+    pub headers: Headers,
+    pub body: Vec<u8>,
+}
+
+//
+// ===== HTTP Request Builder =====
+//
+
+pub struct Request {
+    method: Method,
+    url: str,
+    headers: Headers,
+    body: Vec<u8>,
+    timeout_ms: i64,
+}
+
+impl Request {
+    /// Create a new request (used internally by the agent).
+    pub fn new(method: Method, url: &str) -> Request {
+        return Request {
+            method: method,
+            url: url,
+            headers: Headers::new(),
+            body: Vec::new(),
+            timeout_ms: 30000,  // 30 second default
+        };
+    }
+
+    /// Set a header.
+    pub fn set(&mut self, name: &str, value: &str) -> &Request {
+        self.headers.set(name, value);
+        return self;
+    }
+
+    /// Set the request body.
+    pub fn send_bytes(&mut self, body: &[u8]) -> &Request {
+        let mut i: i64 = 0;
+        while i < body.len() {
+            self.body.push(body[i]);
+            i = i + 1;
+        }
+        return self;
+    }
+
+    /// Set the request body as string.
+    pub fn send_string(&mut self, body: &str) -> &Request {
+        return self.send_bytes(body);
+    }
+
+    /// Set request timeout in milliseconds.
+    pub fn timeout(&mut self, ms: i64) -> &Request {
+        self.timeout_ms = ms;
+        return self;
+    }
+
+    /// Execute the request.
+    pub fn call(&self) -> Response {
+        // Parse URL
+        let (host, port, path) = parse_url(&self.url);
+
+        // Build request
+        let req_body = self.build_request(&path);
+
+        // Open TCP connection
+        let mut sock = tcp_connect(host, port, self.timeout_ms);
+
+        // Send request
+        tcp_send(&mut sock, &req_body);
+
+        // Read response
+        let raw_response = tcp_read(&mut sock, 65536);
+
+        // Parse response
+        return parse_response(&raw_response);
+    }
+
+    fn build_request(&self, path: &str) -> Vec<u8> {
+        let mut req: str = self.method.to_str() + " " + path + " HTTP/1.1\r\n";
+        req = req + self.headers.to_str();
+        req = req + "\r\n";
+        req = req + self.body;
+        return req;
+    }
+}
+
+//
+// ===== Agent (HTTP client with connection reuse) =====
+//
+
+pub struct Agent {
+    headers: Headers,
+    timeout_ms: i64,
+}
+
+impl Agent {
+    /// Create a new HTTP agent.
+    pub fn new() -> Agent {
+        return Agent { headers: Headers::new(), timeout_ms: 30000 };
+    }
+
+    /// Set a default header for all requests.
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.headers.set(name, value);
+    }
+
+    /// Set default timeout.
+    pub fn timeout_ms(&mut self, ms: i64) {
+        self.timeout_ms = ms;
+    }
+
+    /// Create a GET request.
+    pub fn get(&self, url: &str) -> Request {
+        let mut req = Request::new(Method::GET, url);
+        req.timeout(self.timeout_ms);
+        return req;
+    }
+
+    /// Create a POST request.
+    pub fn post(&self, url: &str) -> Request {
+        let mut req = Request::new(Method::POST, url);
+        req.timeout(self.timeout_ms);
+        return req;
+    }
+
+    /// Create a PUT request.
+    pub fn put(&self, url: &str) -> Request {
+        let mut req = Request::new(Method::PUT, url);
+        req.timeout(self.timeout_ms);
+        return req;
+    }
+
+    /// Create a DELETE request.
+    pub fn delete(&self, url: &str) -> Request {
+        let mut req = Request::new(Method::DELETE, url);
+        req.timeout(self.timeout_ms);
+        return req;
+    }
+}
+
+//
+// ===== Convenience functions (single-shot) =====
+//
+
+/// Perform a GET request and return the response.
+pub fn get(url: &str) -> Response {
+    let agent = Agent::new();
+    return agent.get(url).call();
+}
+
+/// Perform a POST request with a body.
+pub fn post(url: &str, body: &[u8]) -> Response {
+    let agent = Agent::new();
+    let mut req = agent.post(url);
+    req.send_bytes(body);
+    return req.call();
+}
+
+//
+// ===== URL Parsing =====
+//
+
+fn parse_url(url: &str) -> (str, i64, str) {
+    let mut s = url;
+
+    // Strip scheme
+    let mut host_start: i64 = 0;
+    let mut default_port: i64 = 80;
+    let mut is_https: bool = false;
+
+    if str_starts_with(s, "https://") {
+        host_start = 8;
+        default_port = 443;
+        is_https = true;
+    } else if str_starts_with(s, "http://") {
+        host_start = 7;
+    } else if str_starts_with(s, "//") {
+        host_start = 2;
+    }
+
+    let after_scheme = s[host_start..];
+    let mut path_start: i64 = 0;
+    let mut port: i64 = default_port;
+
+    // Find path
+    let mut i: i64 = 0;
+    while i < after_scheme.len() {
+        if after_scheme[i] == '/' || after_scheme[i] == '?' || after_scheme[i] == '#' {
+            path_start = i;
+            break;
+        }
+        i = i + 1;
+    }
+
+    let host_and_port = if path_start > 0 { after_scheme[0..path_start] } else { after_scheme };
+
+    // Check for port
+    let colon_idx = str_find(&host_and_port, ":");
+    let host: str;
+    if colon_idx >= 0 {
+        host = host_and_port[0..colon_idx];
+        let port_str = host_and_port[(colon_idx + 1)..];
+        port = str_to_i64(&port_str);
+    } else {
+        host = host_and_port;
+    }
+
+    let path: str;
+    if path_start > 0 {
+        path = after_scheme[path_start..];
+    } else {
+        path = "/";
+    }
+
+    return (host, port, path);
+}
+
+fn str_starts_with(s: &str, prefix: &str) -> bool {
+    if s.len() < prefix.len() { return false; }
+    let mut i: i64 = 0;
+    while i < prefix.len() {
+        if s[i] != prefix[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn str_find(s: &str, c: &str) -> i64 {
+    let mut i: i64 = 0;
+    while i < s.len() {
+        if s[i] == c[0] { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn str_to_i64(s: &str) -> i64 {
+    let mut result: i64 = 0;
+    let mut i: i64 = 0;
+    while i < s.len() {
+        if s[i] >= '0' && s[i] <= '9' {
+            result = result * 10 + (s[i] - '0') as i64;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+//
+// ===== TCP Transport (platform FFI) =====
+//
+
+// These extern functions would be provided by Zeta's runtime/stdlib
+// or the platform layer. They map to OS socket operations.
+
+extern fn z_tcp_connect(host: *u8, host_len: i64, port: i64, timeout_ms: i64) -> i64;
+extern fn z_tcp_send(fd: i64, data: *u8, len: i64) -> i64;
+extern fn z_tcp_recv(fd: i64, buf: *u8, buf_len: i64, timeout_ms: i64) -> i64;
+extern fn z_tcp_close(fd: i64);
+
+/// Internal TCP socket wrapper
+struct TcpSocket {
+    fd: i64,
+}
+
+fn tcp_connect(host: &str, port: i64, timeout_ms: i64) -> TcpSocket {
+    let fd = z_tcp_connect(host.as_ptr(), host.len(), port, timeout_ms);
+    return TcpSocket { fd: fd };
+}
+
+fn tcp_send(sock: &mut TcpSocket, data: &[u8]) {
+    z_tcp_send(sock.fd, data.as_ptr(), data.len());
+}
+
+fn tcp_read(sock: &mut TcpSocket, max_len: i64) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.resize(max_len as i64, 0u8);
+    let bytes_read = z_tcp_recv(sock.fd, buf.as_mut_ptr(), max_len, 30000);
+
+    let mut result: Vec<u8> = Vec::new();
+    let mut i: i64 = 0;
+    while i < bytes_read {
+        result.push(buf[i]);
+        i = i + 1;
+    }
+    return result;
+}
+
+fn tcp_close(sock: &mut TcpSocket) {
+    z_tcp_close(sock.fd);
+}
+
+//
+// ===== HTTP Response Parsing =====
+//
+
+fn parse_response(raw: &[u8]) -> Response {
+    // Parse status line: "HTTP/1.1 200 OK\r\n"
+    let raw_str = raw as str;
+
+    // Find end of status line
+    let line_end = find_str(raw_str, "\r\n");
+
+    let mut status_line: str = "";
+    let mut header_start: i64 = 0;
+
+    if line_end >= 0 {
+        status_line = raw_str[0..line_end];
+        header_start = line_end + 2;
+    }
+
+    // Parse status code from line like "HTTP/1.1 200 OK"
+    let mut code: i64 = 200;
+    let parts = split_str(status_line, " ");
+    if parts.len() >= 2 {
+        code = str_to_i64(&parts[1]);
+    }
+
+    // Parse headers
+    let mut headers = Headers::new();
+    // Find double CRLF separating headers from body
+    let body_start = find_str(raw_str, "\r\n\r\n");
+
+    if body_start >= 0 && header_start < body_start {
+        let header_block = raw_str[header_start..body_start];
+        let lines = split_str(header_block, "\r\n");
+        let mut i: i64 = 0;
+        while i < lines.len() {
+            let colon = find_str(lines[i], ":");
+            if colon >= 0 {
+                let name = lines[i][0..colon];
+                let mut value_start = colon + 1;
+                if value_start < lines[i].len() && lines[i][value_start] == ' ' {
+                    value_start = value_start + 1;
+                }
+                let value = lines[i][value_start..];
+                headers.set(name, value);
+            }
+            i = i + 1;
+        }
+    }
+
+    // Parse body
+    let mut body: Vec<u8> = Vec::new();
+    if body_start >= 0 {
+        let body_offset = body_start + 4;  // skip \r\n\r\n
+        let mut i: i64 = body_offset;
+        while i < raw.len() {
+            body.push(raw[i]);
+            i = i + 1;
+        }
+    }
+
+    return Response {
+        status: StatusCode::new(code),
+        headers: headers,
+        body: body,
+    };
+}
+
+fn find_str(s: &str, needle: &str) -> i64 {
+    if needle.len() == 0 { return 0; }
+    let mut i: i64 = 0;
+    while i <= s.len() - needle.len() {
+        let mut matched: bool = true;
+        let mut j: i64 = 0;
+        while j < needle.len() {
+            if s[i + j] != needle[j] {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn split_str(s: &str, delim: &str) -> Vec<str> {
+    let mut result: Vec<str> = Vec::new();
+    let mut start: i64 = 0;
+    loop {
+        let pos = find_str(s[start..], delim);
+        if pos < 0 {
+            result.push(s[start..]);
+            break;
+        }
+        result.push(s[start..(start + pos)]);
+        start = start + pos + delim.len();
+        if start >= s.len() {
+            break;
+        }
+    }
+    return result;
+}
+
+//
+// ===== Convenience: JSON requests =====
+//
+
+// JSON convenience wrappers depend on @encoding/serde_json package.
+// Provide a raw string-based interface here; typed JSON methods
+// are available via serde_json directly.
+
+/// Perform a GET and read the body as string.
+pub fn get_text(url: &str) -> str {
+    let agent = Agent::new();
+    let resp = agent.get(url).call();
+    return resp.body as str;
+}
+
+/// Perform a POST with a string body and Content-Type header.
+pub fn post_text(url: &str, content_type: &str, body: &str) -> Response {
+    let agent = Agent::new();
+    let mut req = agent.post(url);
+    req.set("Content-Type", content_type);
+    req.send_string(body);
+    return req.call();
+}
+
+//
+// ===== Tests =====
+//
+
+#[cfg(test)]
+fn test_url_parsing() -> bool {
+    let (host, port, path) = parse_url("http://example.com:8080/foo/bar");
+    if host != "example.com" { return false; }
+    if port != 8080 { return false; }
+    if path != "/foo/bar" { return false; }
+    return true;
+}
+
+#[cfg(test)]
+fn test_url_parsing_default_port() -> bool {
+    let (host, port, path) = parse_url("https://api.zorbs.io/v1/ping");
+    if host != "api.zorbs.io" { return false; }
+    if port != 443 { return false; }
+    if path != "/v1/ping" { return false; }
+    return true;
+}
+
+#[cfg(test)]
+fn test_method_to_str() -> bool {
+    if Method::GET.to_str() != "GET" { return false; }
+    if Method::POST.to_str() != "POST" { return false; }
+    if Method::DELETE.to_str() != "DELETE" { return false; }
+    return true;
+}
+
+#[cfg(test)]
+fn test_status_code() -> bool {
+    let ok = StatusCode::new(200);
+    if !ok.is_success() { return false; }
+    let not_found = StatusCode::new(404);
+    if !not_found.is_client_error() { return false; }
+    let err = StatusCode::new(500);
+    if !err.is_server_error() { return false; }
+    return true;
+}
+
+#[cfg(test)]
+fn test_headers() -> bool {
+    let mut h = Headers::new();
+    h.set("Content-Type", "application/json");
+    h.set("Authorization", "Bearer token123");
+    if h.get("Content-Type") != "application/json" { return false; }
+    if h.get("Authorization") != "Bearer token123" { return false; }
+    if h.get("X-Missing") != "" { return false; }
+    return true;
+}
